@@ -368,7 +368,11 @@ module JSON
   #   JSON.generate(a)
   #
   def generate(obj, opts = nil)
-    if State === opts
+    if opts.is_a?(Hash) && opts.key?(:profile)
+      opts = opts.dup unless opts.frozen?
+      profile = opts.delete(:profile)
+      profile.generate(obj)
+    elsif State === opts
       opts.generate(obj)
     else
       State.generate(obj, opts.frozen? ? opts : opts.dup, nil)

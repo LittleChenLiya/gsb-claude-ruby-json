@@ -451,4 +451,5 @@ require 'json/common'
 module JSON
   require 'json/version'
   require 'json/ext'
+  require 'json/profile'
 end
