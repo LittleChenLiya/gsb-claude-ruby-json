@@ -3,6 +3,12 @@
 ### Unreleased
 
 * JRuby: parser errors now include the position (`line`, `column` and the message suffix) as well as `json_path`, matching the C extension.
+* Add a `number_class` parse option registering explicit converters for JSON number literals, separately for
+  integer literals (`integer:`) and decimal/exponent literals (`float:`). Each converter receives the raw
+  literal as a string (never pre-parsed as a `Float`), is called exactly once per number, and must be given
+  as an explicit class or callable -- strings/symbols are rejected, no dynamic constant lookup is performed.
+  Literals longer than 1024 bytes are rejected before conversion, and a converter that raises aborts the
+  parse with a `JSON::ParserError` pointing at the literal's position. Default parsing is unchanged.
 
 ### 2026-09-09 (3.0.2)
 

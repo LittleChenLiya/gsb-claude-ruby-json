@@ -793,6 +793,7 @@ module JSON
       freeze
       allow_duplicate_key
       decimal_class
+      number_class
     ).freeze
     private_constant :PARSER_OPTIONS
 

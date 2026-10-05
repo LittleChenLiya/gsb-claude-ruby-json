@@ -5,14 +5,15 @@
 static VALUE mJSON, eNestingError, eParserError, Encoding_UTF_8;
 static VALUE CNaN, CInfinity, CMinusInfinity, JSON_empty_string;
 
-static ID i_new, i_try_convert, i_encode, i_at_line, i_at_column, i_at_json_path;
+static ID i_new, i_try_convert, i_call, i_encode, i_at_line, i_at_column, i_at_json_path;
 #ifndef HAVE_RB_STR_TO_INTERNED_STR
 static ID i_uminus;
 #endif
 
 static VALUE sym_max_nesting, sym_allow_nan, sym_allow_trailing_comma, sym_allow_comments,
              sym_allow_control_characters, sym_allow_invalid_escape, sym_symbolize_names,
-             sym_freeze, sym_decimal_class, sym_on_load, sym_allow_duplicate_key;
+             sym_freeze, sym_decimal_class, sym_on_load, sym_allow_duplicate_key,
+             sym_number_class, sym_integer, sym_float;
 
 static int binary_encindex;
 static int utf8_encindex;
@@ -407,6 +408,10 @@ typedef struct JSON_ParserStruct {
     VALUE on_load_proc;
     VALUE decimal_class;
     ID decimal_method_id;
+    VALUE integer_converter;
+    ID integer_converter_method_id;
+    VALUE float_converter;
+    ID float_converter_method_id;
     int max_nesting;
     bool allow_comments;
     bool allow_duplicate_key;
@@ -1190,6 +1195,63 @@ static inline VALUE json_decode_float(JSON_ParserConfig *config, uint64_t mantis
     return DBL2NUM(ffp_s2d(exponent, mantissa, negative));
 }
 
+// When a number_class strategy is registered, number literals longer than this
+// are rejected before any conversion is attempted, so a hostile document can't
+// make a converter chew on an unbounded lexeme.
+#define JSON_MAX_NUMBER_LITERAL_LENGTH 1024
+
+struct json_number_conversion_args {
+    VALUE converter;
+    ID method_id;
+    VALUE text;
+};
+
+static VALUE json_call_number_converter(VALUE data)
+{
+    struct json_number_conversion_args *args = (struct json_number_conversion_args *)data;
+    return rb_funcallv(args->converter, args->method_id, 1, &args->text);
+}
+
+NORETURN(static) void json_raise_number_conversion_error(JSON_ParserState *state, const char *start, VALUE error)
+{
+    // Report the failure at the position of the original number literal,
+    // not wherever the cursor happened to be when the converter raised.
+    state->cursor = start;
+
+    VALUE message = rb_enc_sprintf(enc_utf8, "number conversion failed (%" PRIsVALUE ": %" PRIsVALUE ")",
+        rb_class_name(CLASS_OF(error)), rb_funcall(error, rb_intern("message"), 0));
+
+    // errinfo is left untouched on purpose so the raised ParserError chains
+    // the converter's exception as its #cause.
+    if (state->parser) {
+        rb_exc_raise(parse_error_new(state, message, 0, 0, false));
+    } else {
+        long line, column;
+        cursor_position(state, &line, &column);
+        rb_str_catf(message, " at line %ld column %ld", line, column);
+        rb_exc_raise(parse_error_new(state, message, line, column, false));
+    }
+}
+
+// Hands the raw number lexeme (sign included, exactly as it appears in the
+// source) to the registered converter. The converter is called exactly once
+// per number, and only after the literal has been fully scanned and validated.
+static VALUE json_convert_number(JSON_ParserState *state, VALUE converter, ID method_id, const char *start, long len)
+{
+    struct json_number_conversion_args args = {
+        .converter = converter,
+        .method_id = method_id,
+        .text = rb_str_new(start, len),
+    };
+
+    int raised = 0;
+    VALUE number = rb_protect(json_call_number_converter, (VALUE)&args, &raised);
+    if (RB_UNLIKELY(raised)) {
+        json_raise_number_conversion_error(state, start, rb_errinfo());
+    }
+    return number;
+}
+
 static inline VALUE json_decode_array(JSON_ParserState *state, JSON_ParserConfig *config, long count)
 {
     VALUE array = rb_ary_new_from_values(count, rvalue_stack_peek(state->value_stack, count));
@@ -1526,6 +1588,23 @@ static inline VALUE json_parse_number(JSON_ParserState *state, JSON_ParserConfig
     // the caller needs to detect the incomplete number.
     if (RB_UNLIKELY(resumable && eos(state))) {
         return Qundef;
+    }
+
+    if (RB_UNLIKELY(config->integer_converter || config->float_converter)) {
+        // A number_class strategy is registered: overlong literals are
+        // rejected before any conversion is attempted.
+        long lexeme_length = state->cursor - start;
+        if (RB_UNLIKELY(lexeme_length > JSON_MAX_NUMBER_LITERAL_LENGTH)) {
+            raise_parse_error_at("number literal is too long: %s", state, start, false);
+        }
+
+        VALUE converter = integer ? config->integer_converter : config->float_converter;
+        if (converter) {
+            ID method_id = integer ? config->integer_converter_method_id : config->float_converter_method_id;
+            return json_convert_number(state, converter, method_id, start, lexeme_length);
+        }
+        // No converter registered for this kind of literal: fall through to
+        // the default decoding.
     }
 
     if (integer) {
@@ -2001,6 +2080,70 @@ static void parser_config_wb_write(VALUE self, VALUE *dest, VALUE val)
     if (self) RB_OBJ_WRITTEN(self, Qundef, val);
 }
 
+struct number_class_init_args {
+    JSON_ParserConfig *config;
+    VALUE self;
+};
+
+// Registers one converter of a number_class strategy. Converters must be
+// handed over as explicit objects (a class or any callable); strings and
+// symbols are rejected so this mechanism never performs constant lookup or
+// dynamic class loading (unlike the historical, and removed,
+// create_additions/json_class mechanism, which must not be reintroduced
+// through number_class either).
+static int parser_number_class_init_i(VALUE key, VALUE val, VALUE data)
+{
+    struct number_class_init_args *args = (struct number_class_init_args *)data;
+    JSON_ParserConfig *config = args->config;
+
+    VALUE *converter_slot;
+    ID *method_id_slot;
+    const char *kind;
+
+    if (key == sym_integer) {
+        converter_slot = &config->integer_converter;
+        method_id_slot = &config->integer_converter_method_id;
+        kind = "integer";
+    } else if (key == sym_float) {
+        converter_slot = &config->float_converter;
+        method_id_slot = &config->float_converter_method_id;
+        kind = "float";
+    } else {
+        rb_raise(rb_eArgError, "unknown number_class keyword: %" PRIsVALUE, key);
+    }
+
+    if (!RTEST(val)) {
+        return ST_CONTINUE;
+    }
+
+    if (RB_TYPE_P(val, T_STRING) || RB_TYPE_P(val, T_SYMBOL)) {
+        rb_raise(rb_eTypeError,
+            "number_class %s converter must be a class or a callable, not a %" PRIsVALUE ": "
+            "no dynamic constant lookup is performed",
+            kind, rb_class_name(CLASS_OF(val)));
+    }
+
+    VALUE converter = val;
+    ID method_id;
+    if (rb_respond_to(val, i_call)) {
+        method_id = i_call;
+    } else if (rb_respond_to(val, i_new)) {
+        method_id = i_new;
+    } else if (RB_TYPE_P(val, T_CLASS) && !strchr(RSTRING_PTR(rb_class_name(val)), ':')) {
+        // Classes such as Integer or BigDecimal are not directly
+        // instantiable; like decimal_class, call the Kernel method of the
+        // same (toplevel) name, e.g. Kernel.Integer(lexeme).
+        converter = rb_mKernel;
+        method_id = SYM2ID(rb_str_intern(rb_class_name(val)));
+    } else {
+        rb_raise(rb_eTypeError, "number_class %s converter must respond to #call or .new", kind);
+    }
+
+    parser_config_wb_write(args->self, converter_slot, converter);
+    *method_id_slot = method_id;
+    return ST_CONTINUE;
+}
+
 static int parser_config_init_i(VALUE key, VALUE val, VALUE data)
 {
     struct parser_config_init_args *args = (struct parser_config_init_args *)data;
@@ -2052,6 +2195,18 @@ static int parser_config_init_i(VALUE key, VALUE val, VALUE data)
                     config->decimal_method_id = SYM2ID(rb_str_intern(name));
                 }
             }
+        }
+    }
+    else if (key == sym_number_class)               {
+        if (RTEST(val)) {
+            Check_Type(val, T_HASH);
+            // The strategy is captured (sealed) into this configuration now;
+            // mutating the hash afterwards cannot affect any parse.
+            struct number_class_init_args number_class_args = {
+                .config = config,
+                .self = self,
+            };
+            rb_hash_foreach(val, parser_number_class_init_i, (VALUE)&number_class_args);
         }
     }
     else {
@@ -2205,6 +2360,8 @@ static void JSON_ParserConfig_mark(void *ptr)
     JSON_ParserConfig *config = ptr;
     rb_gc_mark_movable(config->on_load_proc);
     rb_gc_mark_movable(config->decimal_class);
+    rb_gc_mark_movable(config->integer_converter);
+    rb_gc_mark_movable(config->float_converter);
 }
 
 static size_t JSON_ParserConfig_memsize(const void *ptr)
@@ -2221,6 +2378,8 @@ static void JSON_ParserConfig_compact(void *ptr)
     JSON_ParserConfig *config = ptr;
     config->on_load_proc = rb_gc_location(config->on_load_proc);
     config->decimal_class = rb_gc_location(config->decimal_class);
+    config->integer_converter = rb_gc_location(config->integer_converter);
+    config->float_converter = rb_gc_location(config->float_converter);
 }
 
 static const rb_data_type_t JSON_ParserConfig_type = {
@@ -2900,10 +3059,14 @@ void Init_parser(void)
     sym_freeze = ID2SYM(rb_intern("freeze"));
     sym_on_load = ID2SYM(rb_intern("on_load"));
     sym_decimal_class = ID2SYM(rb_intern("decimal_class"));
+    sym_number_class = ID2SYM(rb_intern("number_class"));
+    sym_integer = ID2SYM(rb_intern("integer"));
+    sym_float = ID2SYM(rb_intern("float"));
     sym_allow_duplicate_key = ID2SYM(rb_intern("allow_duplicate_key"));
 
     i_new = rb_intern("new");
     i_try_convert = rb_intern("try_convert");
+    i_call = rb_intern("call");
 #ifndef HAVE_RB_STR_TO_INTERNED_STR
     i_uminus = rb_intern("-@");
 #endif

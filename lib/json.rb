@@ -259,6 +259,37 @@ require 'json/common'
 #   ruby = JSON.parse(source, array_class: Set)
 #   ruby # => Set["foo", 1.0, true, false, nil]
 #
+# ---
+#
+# Option +number_class+ (\Hash) registers explicit converters for \JSON number
+# literals, separately for integer literals (key +:integer+) and for
+# decimal/exponent literals (key +:float+); defaults to +nil+ (numbers are
+# decoded to \Integer and \Float as usual).
+#
+# Each converter receives the number literal exactly as it appears in the
+# source (sign included), as a \String -- the literal is never first parsed as
+# a \Float. A converter may be a \Class (instantiated with <tt>.new</tt>, or
+# through the \Kernel method of the same name for classes like \Integer or
+# \BigDecimal) or any callable (<tt>#call</tt>). Converters must be given as
+# explicit objects: strings or symbols are rejected, no constant lookup or
+# dynamic class loading is ever performed.
+#
+# The strategy is captured when the parser configuration is created and stays
+# sealed for the whole parse; each converter is called exactly once per number
+# literal. Literals longer than 1024 bytes are rejected with a
+# JSON::ParserError before conversion, and a converter that raises aborts the
+# parse with a JSON::ParserError pointing at the literal's position (the
+# original exception is available as its <tt>#cause</tt>).
+#
+# With the default, +nil+:
+#   JSON.parse('[9007199254740993, 1.5, -2.5e-3, 42]')
+#   # => [9007199254740993, 1.5, -0.0025, 42]
+#
+# With explicit converters for both kinds of literals:
+#   JSON.parse('[9007199254740993, 1.5, -2.5e-3, 42]',
+#     number_class: { integer: Integer, float: BigDecimal })
+#   # => [9007199254740993, 0.15e1, -0.25e-2, 42]
+#
 # === Generating \JSON
 #
 # To generate a Ruby \String containing \JSON data,
