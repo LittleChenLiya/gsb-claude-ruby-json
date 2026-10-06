@@ -214,6 +214,22 @@ require 'json/common'
 # When enabled:
 #   JSON.parse('"Hell\o"', allow_invalid_escape: true) # => "Hello"
 #
+# ---
+#
+# Option +max_number_length+ (\Integer) specifies the maximum length, in bytes,
+# allowed for a single number literal (sign, fraction and exponent included);
+# defaults to +false+, meaning no limit.
+#
+# A literal longer than the limit is rejected before any conversion happens:
+# no bignum is built and no registered numeric converter (see +integer_class+
+# and +decimal_class+ below) is invoked for it.
+#
+# With the default, no limit is enforced:
+#   JSON.parse('1' * 1024) # => 10**1023 (a huge but exact Integer)
+# With a limit:
+#   JSON.parse('[12345]', max_number_length: 4) # number literal is too long (max_number_length: 4) ... (JSON::ParserError)
+#   JSON.parse('[1234]', max_number_length: 4)  # => [1234]
+#
 # ====== Output Options
 #
 # Option +freeze+ (boolean) specifies whether the returned objects will be frozen;
@@ -258,6 +274,36 @@ require 'json/common'
 # Use class \Set:
 #   ruby = JSON.parse(source, array_class: Set)
 #   ruby # => Set["foo", 1.0, true, false, nil]
+#
+# ---
+#
+# Options +integer_class+ and +decimal_class+ register an explicit numeric
+# conversion strategy. Each number literal's original lexeme (a \String, sign
+# included) is handed exactly once to the matching converter: bare integer
+# literals to +integer_class+, literals with a fractional part or an exponent
+# to +decimal_class+. Converters receive the raw lexeme -- never a pre-parsed
+# \Float -- so integers beyond 2**53 stay exact and decimals keep their
+# original representation.
+#
+# A converter may be a \Class (its factory method is used, e.g.
+# <tt>Kernel.Integer</tt> or <tt>Kernel.BigDecimal</tt>) or any object
+# responding to +new+ or +try_convert+. Strings are never resolved into
+# classes: no dynamic class loading happens, and a +json_class+ key in the
+# document is always treated as plain data.
+#
+# The strategy is sealed for the duration of a parse, and a converter
+# failure raises JSON::ParserError pointing at the offending literal (with
+# the converter's own exception as its +cause+) instead of returning a
+# half-built object.
+#
+# With the defaults, numbers become \Integer and \Float:
+#   source = '[9007199254740993, 1.50, -0.25e3, 42]'
+#   JSON.parse(source) # => [9007199254740993, 1.5, -250.0, 42]
+# With explicit converters (the four numbers above):
+#   JSON.parse(source, integer_class: Integer, decimal_class: BigDecimal)
+#   # => [9007199254740993, 0.15e1, -0.25e3, 42]
+#   # [0] is exactly 2**53 + 1; [1] is BigDecimal('1.50'), built from the
+#   # original lexeme, not from a rounded Float.
 #
 # === Generating \JSON
 #

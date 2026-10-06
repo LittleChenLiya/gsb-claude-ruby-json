@@ -793,6 +793,8 @@ module JSON
       freeze
       allow_duplicate_key
       decimal_class
+      integer_class
+      max_number_length
     ).freeze
     private_constant :PARSER_OPTIONS
 

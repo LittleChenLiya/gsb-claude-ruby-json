@@ -5,14 +5,15 @@
 static VALUE mJSON, eNestingError, eParserError, Encoding_UTF_8;
 static VALUE CNaN, CInfinity, CMinusInfinity, JSON_empty_string;
 
-static ID i_new, i_try_convert, i_encode, i_at_line, i_at_column, i_at_json_path;
+static ID i_new, i_try_convert, i_encode, i_at_line, i_at_column, i_at_json_path, i_message, i_cause;
 #ifndef HAVE_RB_STR_TO_INTERNED_STR
 static ID i_uminus;
 #endif
 
 static VALUE sym_max_nesting, sym_allow_nan, sym_allow_trailing_comma, sym_allow_comments,
              sym_allow_control_characters, sym_allow_invalid_escape, sym_symbolize_names,
-             sym_freeze, sym_decimal_class, sym_on_load, sym_allow_duplicate_key;
+             sym_freeze, sym_decimal_class, sym_integer_class, sym_max_number_length,
+             sym_on_load, sym_allow_duplicate_key;
 
 static int binary_encindex;
 static int utf8_encindex;
@@ -407,6 +408,9 @@ typedef struct JSON_ParserStruct {
     VALUE on_load_proc;
     VALUE decimal_class;
     ID decimal_method_id;
+    VALUE integer_class;
+    ID integer_method_id;
+    long max_number_length;
     int max_nesting;
     bool allow_comments;
     bool allow_duplicate_key;
@@ -1106,6 +1110,95 @@ static inline VALUE json_decode_large_number(const char *start, long len, json_n
     }
 }
 
+/* Explicit numeric conversion strategy.
+ *
+ * When +integer_class+ and/or +decimal_class+ converters are registered, the
+ * parser hands each number's original lexeme (as a String, sign included) to
+ * the matching converter exactly once: bare integer literals go to
+ * +integer_class+, literals with a fractional part or an exponent go to
+ * +decimal_class+. Converters receive the raw lexeme, never a pre-parsed
+ * Float, and are never resolved from strings: no dynamic class loading.
+ */
+
+struct number_converter_call {
+    VALUE converter;
+    ID method_id;
+    VALUE lexeme;
+};
+
+static VALUE json_number_converter_call(VALUE ptr)
+{
+    struct number_converter_call *call = (struct number_converter_call *)ptr;
+    return rb_funcallv(call->converter, call->method_id, 1, &call->lexeme);
+}
+
+NORETURN(static) void json_raise_number_converter_error(JSON_ParserState *state, const char *start, VALUE original)
+{
+    VALUE message = rb_sprintf(
+        "number converter raised %"PRIsVALUE": %"PRIsVALUE,
+        rb_class_name(rb_obj_class(original)),
+        rb_funcall(original, i_message, 0)
+    );
+
+    if (state->parser) {
+        // Line and column can't be accurate in resumable mode.
+        VALUE exc = parse_error_new(state, message, 0, 0, false);
+        rb_ivar_set(exc, i_cause, original);
+        rb_exc_raise(exc);
+    } else {
+        // Point the error at the start of the offending number literal, so
+        // the original position is preserved even though the cursor has
+        // already moved past the literal.
+        state->cursor = start;
+        long line, column;
+        cursor_position(state, &line, &column);
+        rb_str_catf(message, " at line %ld column %ld", line, column);
+        VALUE exc = parse_error_new(state, message, line, column, false);
+        rb_ivar_set(exc, i_cause, original);
+        rb_exc_raise(exc);
+    }
+}
+
+/* Call the registered converter exactly once for the lexeme [start, end).
+ * A converter failure never yields a half-built value: it is re-raised as a
+ * JSON::ParserError carrying the literal's original position, with the
+ * converter's own exception preserved as the cause.
+ */
+static VALUE json_convert_number_lexeme(JSON_ParserState *state, VALUE converter, ID method_id, const char *start, const char *end)
+{
+    struct number_converter_call call = {
+        .converter = converter,
+        .method_id = method_id,
+        .lexeme = rb_str_new(start, end - start),
+    };
+
+    int raised = 0;
+    VALUE result = rb_protect(json_number_converter_call, (VALUE)&call, &raised);
+    if (RB_UNLIKELY(raised)) {
+        json_raise_number_converter_error(state, start, rb_errinfo());
+    }
+    return result;
+}
+
+NORETURN(static) void raise_number_too_long(JSON_ParserState *state, const char *start, long max_number_length)
+{
+    VALUE message = rb_sprintf(
+        "number literal is too long (max_number_length: %ld)",
+        max_number_length
+    );
+
+    if (state->parser) {
+        // Line and column can't be accurate in resumable mode.
+        rb_exc_raise(parse_error_new(state, message, 0, 0, false));
+    } else {
+        state->cursor = start;
+        long line, column;
+        cursor_position(state, &line, &column);
+        rb_str_catf(message, " at line %ld column %ld", line, column);
+        rb_exc_raise(parse_error_new(state, message, line, column, false));
+    }
+}
+
 static VALUE json_decode_inum(const char *buffer)
 {
     return rb_cstr2inum(buffer, 10);
@@ -1160,14 +1253,9 @@ NOINLINE(static) VALUE json_decode_large_float(const char *start, long len)
 /* Ruby JSON optimized float decoder using vendored Ryu algorithm
  * Accepts pre-extracted mantissa and exponent from first-pass validation
  */
-static inline VALUE json_decode_float(JSON_ParserConfig *config, uint64_t mantissa, int mantissa_digits, int64_t exponent, bool negative,
+static inline VALUE json_decode_float(uint64_t mantissa, int mantissa_digits, int64_t exponent, bool negative,
                                           const char *start, const char *end)
 {
-    if (RB_UNLIKELY(config->decimal_class)) {
-        VALUE text = rb_str_new(start, end - start);
-        return rb_funcallv(config->decimal_class, config->decimal_method_id, 1, &text);
-    }
-
     if (RB_UNLIKELY(exponent > INT32_MAX)) {
         return negative ? CMinusInfinity : CInfinity;
     }
@@ -1518,6 +1606,15 @@ static inline VALUE json_parse_number(JSON_ParserState *state, JSON_ParserConfig
         }
     }
 
+    // An overlong literal is rejected up front: no bignum is built and no
+    // registered converter is invoked for a number past the length limit.
+    // This runs even before the resumable end-of-buffer check below, so a
+    // streamed number is refused as soon as it exceeds the limit rather than
+    // being buffered further.
+    if (RB_UNLIKELY(config->max_number_length > 0) && RB_UNLIKELY(state->cursor - start > config->max_number_length)) {
+        raise_number_too_long(state, start, config->max_number_length);
+    }
+
     // A number touching the end of the buffer may still grow in a later chunk,
     // so the caller will rewind and wait. Decoding it now would build a value
     // -- for a long run of digits, an expensive bignum -- only to discard it,
@@ -1529,6 +1626,9 @@ static inline VALUE json_parse_number(JSON_ParserState *state, JSON_ParserConfig
     }
 
     if (integer) {
+        if (RB_UNLIKELY(config->integer_class)) {
+            return json_convert_number_lexeme(state, config->integer_class, config->integer_method_id, start, state->cursor);
+        }
         return json_decode_integer(mantissa, mantissa_digits, negative, start, state->cursor);
     }
 
@@ -1537,7 +1637,11 @@ static inline VALUE json_parse_number(JSON_ParserState *state, JSON_ParserConfig
         exponent -= (mantissa_digits - decimal_point_pos);
     }
 
-    return json_decode_float(config, mantissa, mantissa_digits, exponent, negative, start, state->cursor);
+    if (RB_UNLIKELY(config->decimal_class)) {
+        return json_convert_number_lexeme(state, config->decimal_class, config->decimal_method_id, start, state->cursor);
+    }
+
+    return json_decode_float(mantissa, mantissa_digits, exponent, negative, start, state->cursor);
 }
 
 // How many values (array elements, or interleaved object keys+values) have been
@@ -2001,6 +2105,66 @@ static void parser_config_wb_write(VALUE self, VALUE *dest, VALUE val)
     if (self) RB_OBJ_WRITTEN(self, Qundef, val);
 }
 
+/* Register an explicit numeric converter (+integer_class+ / +decimal_class+).
+ *
+ * The converter must be handed over as a ready-to-use object:
+ *
+ * - a Class is instantiated with +new+, or, when it has no +new+ (like
+ *   Integer or BigDecimal), the matching factory method is used (e.g.
+ *   Kernel.Integer, Kernel.BigDecimal). Note that core classes such as
+ *   Integer respond to +try_convert+, but that method converts Ruby objects,
+ *   not lexeme strings, so it must not take precedence for classes;
+ * - any other object responding to +try_convert+ or +new+ is called with
+ *   the lexeme.
+ *
+ * Strings or other inert values are rejected outright -- they are never
+ * resolved into classes, so this mechanism cannot be turned into dynamic,
+ * name-based class loading.
+ */
+static void parser_config_set_number_converter(VALUE self, const char *option_name, VALUE *converter_slot, ID *method_id_slot, VALUE val)
+{
+    if (!RTEST(val)) {
+        return;
+    }
+
+    if (RB_TYPE_P(val, T_CLASS)) {
+        if (rb_respond_to(val, i_new)) {
+            parser_config_wb_write(self, converter_slot, val);
+            *method_id_slot = i_new;
+            return;
+        }
+
+        VALUE name = rb_class_name(val);
+        const char *name_cstr = RSTRING_PTR(name);
+        const char *last_colon = strrchr(name_cstr, ':');
+        if (last_colon) {
+            const char *mod_path_end = last_colon - 1;
+            VALUE mod_path = rb_str_substr(name, 0, mod_path_end - name_cstr);
+            parser_config_wb_write(self, converter_slot, rb_path_to_class(mod_path));
+
+            const char *method_name_beg = last_colon + 1;
+            long before_len = method_name_beg - name_cstr;
+            long len = RSTRING_LEN(name) - before_len;
+            VALUE method_name = rb_str_substr(name, before_len, len);
+            *method_id_slot = SYM2ID(rb_str_intern(method_name));
+        } else {
+            parser_config_wb_write(self, converter_slot, rb_mKernel);
+            *method_id_slot = SYM2ID(rb_str_intern(name));
+        }
+    } else if (rb_respond_to(val, i_try_convert)) {
+        parser_config_wb_write(self, converter_slot, val);
+        *method_id_slot = i_try_convert;
+    } else if (rb_respond_to(val, i_new)) {
+        parser_config_wb_write(self, converter_slot, val);
+        *method_id_slot = i_new;
+    } else {
+        rb_raise(rb_eArgError,
+            "%s must be a class or respond to try_convert or new; strings are never resolved into classes",
+            option_name
+        );
+    }
+}
+
 static int parser_config_init_i(VALUE key, VALUE val, VALUE data)
 {
     struct parser_config_init_args *args = (struct parser_config_init_args *)data;
@@ -2026,32 +2190,20 @@ static int parser_config_init_i(VALUE key, VALUE val, VALUE data)
     }
     else if (key == sym_allow_duplicate_key)        { config->allow_duplicate_key = RTEST(val); }
     else if (key == sym_decimal_class)              {
+        parser_config_set_number_converter(self, "decimal_class", &config->decimal_class, &config->decimal_method_id, val);
+    }
+    else if (key == sym_integer_class)              {
+        parser_config_set_number_converter(self, "integer_class", &config->integer_class, &config->integer_method_id, val);
+    }
+    else if (key == sym_max_number_length)          {
         if (RTEST(val)) {
-            if (rb_respond_to(val, i_try_convert)) {
-                parser_config_wb_write(self, &config->decimal_class, val);
-                config->decimal_method_id = i_try_convert;
-            } else if (rb_respond_to(val, i_new)) {
-                parser_config_wb_write(self, &config->decimal_class, val);
-                config->decimal_method_id = i_new;
-            } else if (RB_TYPE_P(val, T_CLASS)) {
-                VALUE name = rb_class_name(val);
-                const char *name_cstr = RSTRING_PTR(name);
-                const char *last_colon = strrchr(name_cstr, ':');
-                if (last_colon) {
-                    const char *mod_path_end = last_colon - 1;
-                    VALUE mod_path = rb_str_substr(name, 0, mod_path_end - name_cstr);
-                    parser_config_wb_write(self, &config->decimal_class, rb_path_to_class(mod_path));
-
-                    const char *method_name_beg = last_colon + 1;
-                    long before_len = method_name_beg - name_cstr;
-                    long len = RSTRING_LEN(name) - before_len;
-                    VALUE method_name = rb_str_substr(name, before_len, len);
-                    config->decimal_method_id = SYM2ID(rb_str_intern(method_name));
-                } else {
-                    parser_config_wb_write(self, &config->decimal_class, rb_mKernel);
-                    config->decimal_method_id = SYM2ID(rb_str_intern(name));
-                }
+            long limit = NUM2LONG(val);
+            if (limit < 0) {
+                rb_raise(rb_eArgError, "max_number_length must be a non-negative Integer");
             }
+            config->max_number_length = limit;
+        } else {
+            config->max_number_length = 0;
         }
     }
     else {
@@ -2188,7 +2340,14 @@ static VALUE cParser_parse(JSON_ParserConfig *config, VALUE src)
 static VALUE cParserConfig_parse(VALUE self, VALUE Vsource)
 {
     GET_PARSER_CONFIG;
-    return cParser_parse(config, Vsource);
+
+    // Parse on a private copy of the configuration: the strategy for this
+    // parse is sealed, so a converter or on_load callback re-initializing
+    // this Config object cannot swap options (e.g. the numeric converters)
+    // in the middle of the parse. The copy lives on the machine stack, so
+    // the conservative GC keeps its references alive and pinned.
+    JSON_ParserConfig snapshot = *config;
+    return cParser_parse(&snapshot, Vsource);
 }
 
 static VALUE cParser_m_parse(VALUE klass, VALUE Vsource, VALUE opts)
@@ -2205,6 +2364,7 @@ static void JSON_ParserConfig_mark(void *ptr)
     JSON_ParserConfig *config = ptr;
     rb_gc_mark_movable(config->on_load_proc);
     rb_gc_mark_movable(config->decimal_class);
+    rb_gc_mark_movable(config->integer_class);
 }
 
 static size_t JSON_ParserConfig_memsize(const void *ptr)
@@ -2221,6 +2381,7 @@ static void JSON_ParserConfig_compact(void *ptr)
     JSON_ParserConfig *config = ptr;
     config->on_load_proc = rb_gc_location(config->on_load_proc);
     config->decimal_class = rb_gc_location(config->decimal_class);
+    config->integer_class = rb_gc_location(config->integer_class);
 }
 
 static const rb_data_type_t JSON_ParserConfig_type = {
@@ -2900,10 +3061,14 @@ void Init_parser(void)
     sym_freeze = ID2SYM(rb_intern("freeze"));
     sym_on_load = ID2SYM(rb_intern("on_load"));
     sym_decimal_class = ID2SYM(rb_intern("decimal_class"));
+    sym_integer_class = ID2SYM(rb_intern("integer_class"));
+    sym_max_number_length = ID2SYM(rb_intern("max_number_length"));
     sym_allow_duplicate_key = ID2SYM(rb_intern("allow_duplicate_key"));
 
     i_new = rb_intern("new");
     i_try_convert = rb_intern("try_convert");
+    i_message = rb_intern("message");
+    i_cause = rb_intern("cause");
 #ifndef HAVE_RB_STR_TO_INTERNED_STR
     i_uminus = rb_intern("-@");
 #endif

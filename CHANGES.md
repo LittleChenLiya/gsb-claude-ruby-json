@@ -3,6 +3,7 @@
 ### Unreleased
 
 * JRuby: parser errors now include the position (`line`, `column` and the message suffix) as well as `json_path`, matching the C extension.
+* Add an explicit numeric conversion strategy to the parser: the new `integer_class` option receives bare integer lexemes while `decimal_class` receives literals with a fraction or exponent, each converter being called exactly once per number with the original lexeme (never a pre-parsed `Float`), so integers beyond 2**53 stay exact. The strategy is sealed for the duration of a parse, the new `max_number_length` option rejects overlong literals before any conversion, and a converter failure raises `JSON::ParserError` at the literal's position (with the original exception as `cause`) instead of returning a half-built object. Converter values are never resolved from strings, so no dynamic class loading is possible. Default parsing is unchanged.
 
 ### 2026-09-09 (3.0.2)
 
