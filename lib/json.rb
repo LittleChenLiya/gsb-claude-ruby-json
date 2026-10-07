@@ -150,6 +150,42 @@ require 'json/common'
 #
 # ---
 #
+# Option +duplicate_key+ (Symbol) selects the strategy used when an object
+# contains the same key more than once; it is an explicit alternative to
+# +allow_duplicate_key+ and takes precedence over it when both are given:
+#
+# - <tt>:reject</tt> (the default): raise JSON::ParserError.
+#   The error message contains the duplicated key, and
+#   JSON::ParserError#json_path locates it in the document:
+#     begin
+#       JSON.parse('{"x": {"a": 1, "a": 2}}', duplicate_key: :reject)
+#     rescue JSON::ParserError => error
+#       error.message   # => 'duplicate key "a" at line 1 column 12'
+#       error.json_path # => "$.x.a"
+#     end
+# - <tt>:last</tt>: keep the last value, like <tt>allow_duplicate_key: true</tt>:
+#     JSON.parse('{"a": 1, "a": 2}', duplicate_key: :last) # => {"a" => 2}
+#
+# ---
+#
+# Option +create_additions+ (boolean) specifies whether parsed objects that
+# carry a class hint should be deserialized into custom Ruby objects;
+# defaults to +false+.
+#
+# When enabled, any parsed object (Hash) that has a +create_id+ key
+# (<tt>"json_class"</tt> by default, configurable with option +create_id+)
+# naming a class that responds to +json_create+ is passed to that method:
+#   class Range
+#     def self.json_create(hash) = new(hash['a'], hash['b'])
+#   end
+#   JSON.parse('{"json_class":"Range","a":1,"b":3}', create_additions: true) # => 1..3
+#
+# The +json_create+ hook runs only after a value has been fully decoded,
+# hence after duplicate key validation: when the duplicate key strategy
+# rejects the document, no +json_create+ hook is called at all.
+#
+# ---
+#
 # Option +allow_nan+ (boolean) specifies whether to allow
 # NaN, Infinity, and MinusInfinity in +source+;
 # defaults to +false+.

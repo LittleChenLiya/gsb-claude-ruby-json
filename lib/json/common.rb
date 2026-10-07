@@ -11,6 +11,37 @@ module JSON
         on_load
       end
 
+      # Builds a proc implementing the +create_additions+ option.
+      #
+      # The parser invokes it (through the +on_load+ option) only after a
+      # value has been fully decoded, hence after duplicate key validation:
+      # when the duplicate key strategy rejects a document, this hook is
+      # never called.
+      def create_additions_hook(create_id, on_load)
+        create_id = create_id.to_s
+        ->(obj) do
+          if Hash === obj
+            class_name = obj[create_id]
+            if String === class_name && (klass = ParserOptions.json_creatable_class(class_name))
+              obj = klass.json_create(obj)
+            end
+          end
+          on_load.nil? ? obj : on_load.call(obj)
+        end
+      end
+
+      # Resolves +class_name+ (e.g. "Foo::Bar") to a class responding to
+      # +json_create+, or +nil+ when it can't be resolved or isn't creatable.
+      def json_creatable_class(class_name)
+        klass = class_name.split('::').reject(&:empty?).reduce(Object) do |namespace, const_name|
+          return nil unless namespace.is_a?(Module) && namespace.const_defined?(const_name, false)
+          namespace.const_get(const_name, false)
+        end
+        klass.respond_to?(:json_create) ? klass : nil
+      rescue NameError
+        nil
+      end
+
       private
 
       def object_class_proc(object_class, on_load)
@@ -286,6 +317,13 @@ module JSON
   #   JSON.parse('invalid')
   #
   def parse(source, on_load: nil, object_class: nil, array_class: nil, **options)
+    if options.delete(:create_additions)
+      create_id = options.delete(:create_id) || 'json_class'
+      on_load = ParserOptions.create_additions_hook(create_id, on_load)
+    else
+      options.delete(:create_id)
+    end
+
     if object_class || array_class
       on_load = ParserOptions.on_load(on_load, object_class, array_class)
     end
@@ -792,6 +830,7 @@ module JSON
       symbolize_names
       freeze
       allow_duplicate_key
+      duplicate_key
       decimal_class
     ).freeze
     private_constant :PARSER_OPTIONS
@@ -828,6 +867,13 @@ module JSON
     #  puts MyApp::API_JSON_CODER.dump(Time.now.utc) # => "2025-01-21T08:41:44.286Z"
     #
     def initialize(object_class: nil, array_class: nil, on_load: nil, **options, &as_json)
+      if options.delete(:create_additions)
+        create_id = options.delete(:create_id) || 'json_class'
+        on_load = ParserOptions.create_additions_hook(create_id, on_load)
+      else
+        options.delete(:create_id)
+      end
+
       if object_class || array_class
         on_load = ParserOptions.on_load(on_load, object_class, array_class)
       end

@@ -12,7 +12,8 @@ static ID i_uminus;
 
 static VALUE sym_max_nesting, sym_allow_nan, sym_allow_trailing_comma, sym_allow_comments,
              sym_allow_control_characters, sym_allow_invalid_escape, sym_symbolize_names,
-             sym_freeze, sym_decimal_class, sym_on_load, sym_allow_duplicate_key;
+             sym_freeze, sym_decimal_class, sym_on_load, sym_allow_duplicate_key,
+             sym_duplicate_key, sym_reject, sym_last;
 
 static int binary_encindex;
 static int utf8_encindex;
@@ -1992,6 +1993,7 @@ struct parser_config_init_args {
     JSON_ParserConfig *config;
     VALUE self;
     VALUE unknown_keywords;
+    VALUE duplicate_key;
     bool strict;
 };
 
@@ -2025,6 +2027,12 @@ static int parser_config_init_i(VALUE key, VALUE val, VALUE data)
         parser_config_wb_write(self, &config->on_load_proc, RTEST(val) ? val : Qfalse);
     }
     else if (key == sym_allow_duplicate_key)        { config->allow_duplicate_key = RTEST(val); }
+    else if (key == sym_duplicate_key)              {
+        // Defer application to parser_config_init so the explicit strategy
+        // takes precedence over allow_duplicate_key regardless of the order
+        // in which options were provided.
+        args->duplicate_key = val;
+    }
     else if (key == sym_decimal_class)              {
         if (RTEST(val)) {
             if (rb_respond_to(val, i_try_convert)) {
@@ -2064,6 +2072,19 @@ static int parser_config_init_i(VALUE key, VALUE val, VALUE data)
     return ST_CONTINUE;
 }
 
+static void parser_config_apply_duplicate_key_strategy(JSON_ParserConfig *config, VALUE strategy)
+{
+    if (strategy == sym_reject) {
+        config->allow_duplicate_key = false;
+    } else if (strategy == sym_last) {
+        config->allow_duplicate_key = true;
+    } else {
+        rb_raise(rb_eArgError,
+            "invalid duplicate_key strategy: %"PRIsVALUE" (expected :reject or :last)",
+            rb_inspect(strategy));
+    }
+}
+
 static void parser_config_init(JSON_ParserConfig *config, VALUE opts, VALUE self, bool strict)
 {
     config->max_nesting = 100;
@@ -2072,6 +2093,7 @@ static void parser_config_init(JSON_ParserConfig *config, VALUE opts, VALUE self
         .config = config,
         .self = self,
         .strict = strict,
+        .duplicate_key = Qundef,
     };
 
     if (NIL_P(opts)) return;
@@ -2081,6 +2103,10 @@ static void parser_config_init(JSON_ParserConfig *config, VALUE opts, VALUE self
     // We assume in most cases few keys are set so it's faster to go over
     // the provided keys than to check all possible keys.
     rb_hash_foreach(opts, parser_config_init_i, (VALUE)&args);
+
+    if (args.duplicate_key != Qundef) {
+        parser_config_apply_duplicate_key_strategy(config, args.duplicate_key);
+    }
 
     raise_argument_error_on_unknown_keywords(args.unknown_keywords);
 }
@@ -2901,6 +2927,9 @@ void Init_parser(void)
     sym_on_load = ID2SYM(rb_intern("on_load"));
     sym_decimal_class = ID2SYM(rb_intern("decimal_class"));
     sym_allow_duplicate_key = ID2SYM(rb_intern("allow_duplicate_key"));
+    sym_duplicate_key = ID2SYM(rb_intern("duplicate_key"));
+    sym_reject = ID2SYM(rb_intern("reject"));
+    sym_last = ID2SYM(rb_intern("last"));
 
     i_new = rb_intern("new");
     i_try_convert = rb_intern("try_convert");

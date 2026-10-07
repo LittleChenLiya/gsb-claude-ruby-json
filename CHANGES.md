@@ -3,6 +3,8 @@
 ### Unreleased
 
 * JRuby: parser errors now include the position (`line`, `column` and the message suffix) as well as `json_path`, matching the C extension.
+* Add a `duplicate_key` parser option selecting the explicit strategy for duplicated object keys: `:reject` (the default, raising `JSON::ParserError` with the duplicated key and its nested `json_path`) or `:last` (keep the last value). It takes precedence over the legacy `allow_duplicate_key` boolean, which keeps working unchanged.
+* Reintroduce an opt-in `create_additions` parsing option (with `create_id`, defaulting to `"json_class"`): hashes carrying a class hint are passed to the class's `json_create` hook. The hook runs strictly after duplicate key validation, so rejected documents never trigger it. The default remains `false`.
 
 ### 2026-09-09 (3.0.2)
 
