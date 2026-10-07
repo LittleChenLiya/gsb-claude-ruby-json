@@ -57,6 +57,10 @@ struct generate_json_data {
     VALUE obj;
     generator_func func;
     long depth;
+    /* Ruby Array tracking the current position in the document being
+     * generated: String segments for object keys, Fixnum segments for
+     * array indices. Used to add path context to generator errors. */
+    VALUE path;
 };
 
 static SIMD_Implementation simd_impl;
@@ -95,6 +99,40 @@ NORETURN(static void) raise_generator_error(VALUE invalid_object, const char *fm
     VALUE str = rb_vsprintf(fmt, args);
     va_end(args);
     raise_generator_error_str(invalid_object, str);
+}
+
+/* Returns true if +key+ is a String made only of characters that can be
+ * used in a dotted JSONPath-like segment (e.g. `$.key`). */
+static bool json_simple_path_key_p(VALUE key)
+{
+    if (!RB_TYPE_P(key, T_STRING)) return false;
+    long len = RSTRING_LEN(key);
+    if (len == 0) return false;
+    const unsigned char *ptr = (const unsigned char *)RSTRING_PTR(key);
+    for (long i = 0; i < len; i++) {
+        unsigned char c = ptr[i];
+        if (!(ISALNUM(c) || c == '_') || (i == 0 && ISDIGIT(c))) return false;
+    }
+    return true;
+}
+
+/* Renders the current generation path (e.g. `$`, `$.items[1]`, `$[0].inf`)
+ * from the segments recorded in data->path. */
+static VALUE json_generation_path_string(struct generate_json_data *data)
+{
+    VALUE str = rb_utf8_str_new_cstr("$");
+    long i, len = RARRAY_LEN(data->path);
+    for (i = 0; i < len; i++) {
+        VALUE segment = rb_ary_entry(data->path, i);
+        if (RB_FIXNUM_P(segment)) {
+            rb_str_catf(str, "[%ld]", FIX2LONG(segment));
+        } else if (rb_enc_compatible(str, segment) && json_simple_path_key_p(segment)) {
+            rb_str_catf(str, ".%"PRIsVALUE, segment);
+        } else {
+            rb_str_catf(str, "[%"PRIsVALUE"]", rb_inspect(segment));
+        }
+    }
+    return str;
 }
 
 // 0 - single byte char that don't need to be escaped.
@@ -1037,7 +1075,9 @@ json_object_i(VALUE key, VALUE val, VALUE _arg)
     if (RB_UNLIKELY(state->space_before)) fbuffer_append_str(buffer, data->state->space_before);
     fbuffer_append_char(buffer, ':');
     if (RB_UNLIKELY(state->space)) fbuffer_append_str(buffer, data->state->space);
+    rb_ary_push(data->path, key_to_s);
     generate_json(buffer, data, val);
+    rb_ary_pop(data->path);
 
     return ST_CONTINUE;
 }
@@ -1109,7 +1149,9 @@ static void generate_json_array(FBuffer *buffer, struct generate_json_data *data
         if (RB_UNLIKELY(data->state->indent)) {
             fbuffer_append_str_repeat(buffer, data->state->indent, depth);
         }
+        rb_ary_push(data->path, INT2FIX(i));
         generate_json(buffer, data, RARRAY_AREF(obj, i));
+        rb_ary_pop(data->path);
     }
     data->depth = --depth;
     if (RB_UNLIKELY(data->state->array_nl)) {
@@ -1177,7 +1219,8 @@ static void generate_json_float(FBuffer *buffer, struct generate_json_data *data
                     return;
                 }
             }
-            raise_generator_error(obj, "%"PRIsVALUE" not allowed in JSON", rb_funcall(obj, i_to_s, 0));
+            raise_generator_error(obj, "%"PRIsVALUE" not allowed in JSON at path %"PRIsVALUE,
+                    rb_funcall(obj, i_to_s, 0), json_generation_path_string(data));
         }
 
         VALUE tmp = rb_funcall(obj, i_to_s, 0);
@@ -1340,7 +1383,8 @@ static inline VALUE cState_partial_generate(VALUE self, VALUE obj, generator_fun
         .state = state,
         .depth = state->depth,
         .obj = obj,
-        .func = func
+        .func = func,
+        .path = rb_ary_new()
     };
     return rb_ensure(generate_json_try, (VALUE)&data, generate_json_ensure, (VALUE)&data);
 }
@@ -2019,6 +2063,7 @@ static VALUE cState_m_do_generate(VALUE klass, VALUE obj, VALUE opts, VALUE io, 
         .depth = state.depth,
         .obj = obj,
         .func = func,
+        .path = rb_ary_new(),
     };
     return rb_ensure(generate_json_try, (VALUE)&data, generate_json_ensure, (VALUE)&data);
 }

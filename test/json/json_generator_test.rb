@@ -411,6 +411,46 @@ class JSONGeneratorTest < Test::Unit::TestCase
     assert_equal "[\n  -Infinity\n]", pretty_generate([JSON::MinusInfinity], allow_nan: true)
   end
 
+  def test_allow_nan_error_path
+    counter = Class.new do
+      attr_reader :calls
+
+      def initialize
+        @calls = 0
+      end
+
+      def to_json(*)
+        @calls += 1
+        '"counted"'
+      end
+    end.new
+
+    # Two-level structure: NaN behind an object key and an array index.
+    error = assert_raise(GeneratorError) { generate({ "items" => [1, JSON::NaN], "counter" => counter }) }
+    assert_same JSON::NaN, error.invalid_object
+    assert_include error.message, "NaN not allowed in JSON"
+    assert_include error.message, "$.items[1]"
+    # Siblings after the failing value must not be serialized eagerly.
+    assert_equal 0, counter.calls
+
+    # Two-level structure: Infinity behind an array index and an object key.
+    error = assert_raise(GeneratorError) { generate([{ "inf" => JSON::Infinity }]) }
+    assert_same JSON::Infinity, error.invalid_object
+    assert_include error.message, "Infinity not allowed in JSON"
+    assert_include error.message, "$[0].inf"
+
+    # Root level non-finite float points at the document root.
+    error = assert_raise(GeneratorError) { generate(JSON::MinusInfinity) }
+    assert_same JSON::MinusInfinity, error.invalid_object
+    assert_include error.message, "-Infinity not allowed in JSON"
+    assert_include error.message, "at path $"
+
+    # allow_nan keeps the original output and in-order to_json calls.
+    assert_equal '{"items":[1,NaN],"counter":"counted"}',
+      generate({ "items" => [1, JSON::NaN], "counter" => counter }, allow_nan: true)
+    assert_equal 1, counter.calls
+  end
+
   # An object that changes state.depth when it receives to_json(state)
   def bad_to_json
     obj = Object.new

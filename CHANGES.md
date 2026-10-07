@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+* Generator errors for non-finite floats (`NaN`, `Infinity`, `-Infinity`) now include the path
+  of the offending value in the document (e.g. `NaN not allowed in JSON at path $.items[1]`),
+  pointing at the object key or array index where generation failed. The exception remains a
+  `JSON::GeneratorError` with the same `invalid_object`, and `allow_nan: true` output is unchanged.
 * JRuby: parser errors now include the position (`line`, `column` and the message suffix) as well as `json_path`, matching the C extension.
 
 ### 2026-09-09 (3.0.2)
