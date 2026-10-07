@@ -142,11 +142,51 @@ require 'json/common'
 # should be ignored or cause an error to be raised:
 #
 # When set to +false+, the default:
-#   JSON.parse('{"a": 1, "a": 2}') # duplicate key "a" at line 1 column 1 (JSON::ParserError)
+#   JSON.parse('{"a": 1, "a": 2}') # duplicate key "a" at $.a at line 1 column 1 (JSON::ParserError)
 #
 # When set to +true+:
 #   # The last value is used.
 #   JSON.parse('{"a": 1, "a": 2}', allow_duplicate_key: true) # => {"a" => 2}
+#
+# ---
+#
+# Option +on_duplicate_key+ (\Symbol) gives explicit control over the
+# strategy used when an object contains a duplicate key;
+# it takes precedence over +allow_duplicate_key+ when both are given:
+#
+# - <tt>:reject</tt>: raise a JSON::ParserError naming the duplicated key
+#   and its nested path (also available via JSON::ParserError#json_path):
+#     begin
+#       JSON.parse('{"x": {"a": 1, "a": 2}}', on_duplicate_key: :reject)
+#     rescue JSON::ParserError => error
+#       error.message  # => 'duplicate key "a" at $.x.a at line 1 column 17'
+#       error.json_path # => "$.x.a"
+#     end
+# - <tt>:use_last</tt>: keep the last value seen for the key:
+#     JSON.parse('{"a": 1, "a": 2}', on_duplicate_key: :use_last) # => {"a" => 2}
+#
+# When the option is not given, the behavior is governed by
+# +allow_duplicate_key+ as before.
+#
+# ---
+#
+# Option +create_additions+ (boolean) specifies whether objects carrying
+# a class hint may be deserialized into custom Ruby types;
+# defaults to +false+.
+#
+# When enabled, any parsed object that has a +create_id+ key
+# (<tt>"json_class"</tt> by default, configurable with option +create_id+)
+# is passed to the +json_create+ method of the named class,
+# after duplicate key validation: if a duplicate key is rejected,
+# the +json_create+ hook is never called.
+#
+#   class Range
+#     def self.json_create(hash) = new(hash["a"], hash["b"])
+#   end
+#   JSON.parse('{"json_class": "Range", "a": 1, "b": 2}', create_additions: true) # => 1..2
+#
+# Note that this option allows instantiating arbitrary classes named in the
+# input, so it must never be enabled for untrusted documents.
 #
 # ---
 #

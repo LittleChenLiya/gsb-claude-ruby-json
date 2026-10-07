@@ -488,6 +488,142 @@ class JSONParserTest < Test::Unit::TestCase
     assert_match "%s%s%s%s", error.message
   end
 
+  def test_parse_on_duplicate_key_strategy
+    # :use_last keeps the last value seen for the key
+    assert_equal({"a" => 2}, parse('{"a": 1, "a": 2}', on_duplicate_key: :use_last))
+
+    # :reject raises, like the default policy
+    error = assert_raise(ParserError) { parse('{"a": 1, "a": 2}', on_duplicate_key: :reject) }
+    assert_include error.message, '"a"'
+
+    # the explicit strategy takes precedence over allow_duplicate_key
+    assert_equal({"a" => 2}, parse('{"a": 1, "a": 2}', allow_duplicate_key: false, on_duplicate_key: :use_last))
+    assert_raise(ParserError) { parse('{"a": 1, "a": 2}', allow_duplicate_key: true, on_duplicate_key: :reject) }
+
+    # invalid strategies are rejected up front
+    assert_raise(ArgumentError) { parse('{}', on_duplicate_key: :bogus) }
+    assert_raise(ArgumentError) { parse('{}', on_duplicate_key: "reject") }
+
+    # when the option is not given, the historical interface is unchanged
+    assert_raise(ParserError) { parse('{"a": 1, "a": 2}') }
+    assert_equal({"a" => 2}, parse('{"a": 1, "a": 2}', allow_duplicate_key: true))
+  end
+
+  def test_parse_on_duplicate_key_nested_path
+    error = assert_raise(ParserError) do
+      parse('{"x": {"a": 1, "b": 2, "a": 3}}', on_duplicate_key: :reject)
+    end
+    assert_equal "$.x.a", error.json_path
+    assert_include error.message, '"a"'
+    assert_include error.message, "$.x.a"
+
+    error = assert_raise(ParserError) do
+      parse('{"arr": [{"a": 1, "a": 2}]}', on_duplicate_key: :reject)
+    end
+    assert_equal "$.arr[0].a", error.json_path
+    assert_include error.message, "$.arr[0].a"
+  end
+
+  class DuplicateKeyWidget
+    CALLS = []
+    attr_reader :source_hash
+
+    def self.json_create(hash)
+      CALLS << hash
+      new(hash)
+    end
+
+    def initialize(hash)
+      @source_hash = hash
+    end
+  end
+
+  def test_parse_create_additions
+    DuplicateKeyWidget::CALLS.clear
+
+    # a valid object carrying json_class is created through the hook
+    widget = parse('{"json_class": "JSONParserTest::DuplicateKeyWidget", "s": "x"}', create_additions: true)
+    assert_instance_of DuplicateKeyWidget, widget
+    assert_equal({"json_class" => "JSONParserTest::DuplicateKeyWidget", "s" => "x"}, widget.source_hash)
+    assert_equal 1, DuplicateKeyWidget::CALLS.size
+
+    # nested objects are converted inside-out
+    DuplicateKeyWidget::CALLS.clear
+    widget = parse(
+      '{"json_class": "JSONParserTest::DuplicateKeyWidget", "inner": {"json_class": "JSONParserTest::DuplicateKeyWidget", "n": 1}}',
+      create_additions: true
+    )
+    assert_instance_of DuplicateKeyWidget, widget
+    assert_instance_of DuplicateKeyWidget, widget.source_hash["inner"]
+    assert_equal 2, DuplicateKeyWidget::CALLS.size
+
+    # symbolized names are honored too
+    DuplicateKeyWidget::CALLS.clear
+    widget = parse('{"json_class": "JSONParserTest::DuplicateKeyWidget", "v": 2}', create_additions: true, symbolize_names: true)
+    assert_instance_of DuplicateKeyWidget, widget
+    assert_equal({json_class: "JSONParserTest::DuplicateKeyWidget", v: 2}, widget.source_hash)
+
+    # a custom create_id can be configured
+    DuplicateKeyWidget::CALLS.clear
+    widget = parse('{"kind": "JSONParserTest::DuplicateKeyWidget"}', create_additions: true, create_id: "kind")
+    assert_instance_of DuplicateKeyWidget, widget
+
+    # without create_additions, no hook is called and a plain Hash is returned
+    DuplicateKeyWidget::CALLS.clear
+    assert_equal(
+      {"json_class" => "JSONParserTest::DuplicateKeyWidget"},
+      parse('{"json_class": "JSONParserTest::DuplicateKeyWidget"}')
+    )
+    assert_equal 0, DuplicateKeyWidget::CALLS.size
+  end
+
+  def test_parse_create_additions_after_duplicate_check
+    DuplicateKeyWidget::CALLS.clear
+
+    # rejecting a duplicate key must not invoke the create hook
+    error = assert_raise(ParserError) do
+      parse(
+        '{"json_class": "JSONParserTest::DuplicateKeyWidget", "a": 1, "a": 2}',
+        create_additions: true,
+        on_duplicate_key: :reject
+      )
+    end
+    assert_include error.message, '"a"'
+    assert_equal 0, DuplicateKeyWidget::CALLS.size
+
+    # same with the historical boolean interface
+    assert_raise(ParserError) do
+      parse(
+        '{"json_class": "JSONParserTest::DuplicateKeyWidget", "a": 1, "a": 2}',
+        create_additions: true,
+        allow_duplicate_key: false
+      )
+    end
+    assert_equal 0, DuplicateKeyWidget::CALLS.size
+
+    # nested duplicate inside a json_class object: hook still not called,
+    # and the path points at the offending key
+    error = assert_raise(ParserError) do
+      parse(
+        '{"outer": {"json_class": "JSONParserTest::DuplicateKeyWidget", "a": 1, "a": 2}}',
+        create_additions: true,
+        on_duplicate_key: :reject
+      )
+    end
+    assert_equal "$.outer.a", error.json_path
+    assert_equal 0, DuplicateKeyWidget::CALLS.size
+
+    # with :use_last the hook runs once, on the last-wins object
+    widget = parse(
+      '{"json_class": "JSONParserTest::DuplicateKeyWidget", "a": 1, "a": 2}',
+      create_additions: true,
+      on_duplicate_key: :use_last
+    )
+    assert_instance_of DuplicateKeyWidget, widget
+    assert_equal 2, widget.source_hash["a"]
+    assert_equal 1, DuplicateKeyWidget::CALLS.size
+  end
+
   def test_some_wrong_inputs
     assert_raise(ParserError) { parse('[] bla') }
     assert_raise(ParserError) { parse('[] 1') }

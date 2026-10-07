@@ -792,6 +792,7 @@ module JSON
       symbolize_names
       freeze
       allow_duplicate_key
+      on_duplicate_key
       decimal_class
     ).freeze
     private_constant :PARSER_OPTIONS

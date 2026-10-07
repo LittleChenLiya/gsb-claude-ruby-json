@@ -4,15 +4,18 @@
 
 static VALUE mJSON, eNestingError, eParserError, Encoding_UTF_8;
 static VALUE CNaN, CInfinity, CMinusInfinity, JSON_empty_string;
+static VALUE JSON_default_create_id;
 
-static ID i_new, i_try_convert, i_encode, i_at_line, i_at_column, i_at_json_path;
+static ID i_new, i_try_convert, i_encode, i_at_line, i_at_column, i_at_json_path, i_json_create, i_json_path;
 #ifndef HAVE_RB_STR_TO_INTERNED_STR
 static ID i_uminus;
 #endif
 
 static VALUE sym_max_nesting, sym_allow_nan, sym_allow_trailing_comma, sym_allow_comments,
              sym_allow_control_characters, sym_allow_invalid_escape, sym_symbolize_names,
-             sym_freeze, sym_decimal_class, sym_on_load, sym_allow_duplicate_key;
+             sym_freeze, sym_decimal_class, sym_on_load, sym_allow_duplicate_key,
+             sym_on_duplicate_key, sym_create_additions, sym_create_id,
+             sym_reject, sym_use_last;
 
 static int binary_encindex;
 static int utf8_encindex;
@@ -403,11 +406,23 @@ typedef struct json_frame_stack_struct {
     json_frame *ptr;
 } json_frame_stack;
 
+// Explicit strategy for handling duplicate object keys. When left at
+// JSON_DUPLICATE_KEY_DEFAULT (the `on_duplicate_key` option wasn't given),
+// the historical `allow_duplicate_key` boolean keeps governing the behavior,
+// so the default policy is unchanged.
+enum json_duplicate_key_strategy {
+    JSON_DUPLICATE_KEY_DEFAULT = 0, // fall back to allow_duplicate_key
+    JSON_DUPLICATE_KEY_REJECT,      // raise a ParserError naming the key and its path
+    JSON_DUPLICATE_KEY_USE_LAST,    // keep the last value seen for the key
+};
+
 typedef struct JSON_ParserStruct {
     VALUE on_load_proc;
     VALUE decimal_class;
+    VALUE create_id;
     ID decimal_method_id;
     int max_nesting;
+    enum json_duplicate_key_strategy duplicate_key_strategy;
     bool allow_comments;
     bool allow_duplicate_key;
     bool allow_nan;
@@ -416,6 +431,7 @@ typedef struct JSON_ParserStruct {
     bool allow_invalid_escape;
     bool symbolize_names;
     bool freeze;
+    bool create_additions;
 } JSON_ParserConfig;
 
 typedef struct JSON_ParserStateStruct {
@@ -1226,25 +1242,72 @@ NORETURN(static) void raise_duplicate_key_error(JSON_ParserState *state, VALUE d
         rb_inspect(duplicate_key)
     );
 
+    VALUE exc = rb_exc_new_str(eParserError, message);
+    rb_ivar_set(exc, i_at_json_path, json_path_new(state, duplicate_key));
+
+    // Include the nested path of the offending key in the message itself,
+    // e.g. `duplicate key "a" at $.x[0].a`.
+    VALUE path = rb_funcall(exc, i_json_path, 0);
+    if (RB_LIKELY(RB_TYPE_P(path, T_STRING)) && RSTRING_LEN(path) > 0) {
+        rb_str_catf(message, " at %"PRIsVALUE, path);
+    }
+
     rb_str_concat(message, build_parse_error_message("", state));
-    VALUE exc;
     if (state->parser) { // line and columns can't be accurate in resumable
-        exc = parse_error_new(state, message, 0, 0, false);
+        rb_ivar_set(exc, i_at_line, INT2FIX(0));
+        rb_ivar_set(exc, i_at_column, INT2FIX(0));
     } else {
         long line, column;
         cursor_position(state, &line, &column);
         rb_str_catf(message, " at line %ld column %ld", line, column);
-        exc = parse_error_new(state, message, line, column, false);
+        rb_ivar_set(exc, i_at_line, LONG2NUM(line));
+        rb_ivar_set(exc, i_at_column, LONG2NUM(column));
     }
-    rb_ivar_set(exc, i_at_json_path, json_path_new(state, duplicate_key));
     rb_exc_raise(exc);
 }
 
 NOINLINE(static) void json_on_duplicate_key(JSON_ParserState *state, JSON_ParserConfig *config, size_t count, const VALUE *pairs)
 {
-    if (!config->allow_duplicate_key) {
+    bool allow = config->allow_duplicate_key;
+    switch (config->duplicate_key_strategy) {
+        case JSON_DUPLICATE_KEY_REJECT:
+            allow = false;
+            break;
+        case JSON_DUPLICATE_KEY_USE_LAST:
+            allow = true;
+            break;
+        case JSON_DUPLICATE_KEY_DEFAULT:
+        default:
+            break;
+    }
+    if (!allow) {
         raise_duplicate_key_error(state, json_find_duplicated_key(count, pairs));
     }
+}
+
+// Invoked when the `create_additions` option is enabled and a freshly parsed
+// object carries the `create_id` key ("json_class" by default). The matching
+// class is resolved and its `json_create` hook is called with the object.
+//
+// This runs strictly after json_decode_object's duplicate key validation, so
+// when a duplicate key is rejected the create hook is never called.
+NOINLINE(static) VALUE json_create_additions(JSON_ParserConfig *config, VALUE object)
+{
+    VALUE create_id = RTEST(config->create_id) ? config->create_id : JSON_default_create_id;
+    if (config->symbolize_names && !RB_SYMBOL_P(create_id)) {
+        create_id = rb_str_intern(create_id);
+    }
+
+    VALUE class_name = rb_hash_lookup2(object, create_id, Qundef);
+    if (UNDEF_P(class_name) || NIL_P(class_name)) {
+        return object;
+    }
+
+    VALUE klass = rb_path_to_class(class_name);
+    if (rb_respond_to(klass, i_json_create)) {
+        return rb_funcall(klass, i_json_create, 1, object);
+    }
+    return object;
 }
 
 static inline VALUE json_decode_object(JSON_ParserState *state, JSON_ParserConfig *config, size_t count)
@@ -1259,6 +1322,10 @@ static inline VALUE json_decode_object(JSON_ParserState *state, JSON_ParserConfi
     }
 
     rvalue_stack_pop(state->value_stack, count);
+
+    if (RB_UNLIKELY(config->create_additions)) {
+        object = json_create_additions(config, object);
+    }
 
     if (config->freeze) {
         RB_OBJ_FREEZE(object);
@@ -2025,6 +2092,27 @@ static int parser_config_init_i(VALUE key, VALUE val, VALUE data)
         parser_config_wb_write(self, &config->on_load_proc, RTEST(val) ? val : Qfalse);
     }
     else if (key == sym_allow_duplicate_key)        { config->allow_duplicate_key = RTEST(val); }
+    else if (key == sym_on_duplicate_key)           {
+        if (!RTEST(val)) {
+            config->duplicate_key_strategy = JSON_DUPLICATE_KEY_DEFAULT;
+        } else if (val == sym_reject) {
+            config->duplicate_key_strategy = JSON_DUPLICATE_KEY_REJECT;
+        } else if (val == sym_use_last) {
+            config->duplicate_key_strategy = JSON_DUPLICATE_KEY_USE_LAST;
+        } else {
+            rb_raise(rb_eArgError, "invalid on_duplicate_key strategy: %"PRIsVALUE" (expected :reject or :use_last)", rb_inspect(val));
+        }
+    }
+    else if (key == sym_create_additions)           { config->create_additions = RTEST(val); }
+    else if (key == sym_create_id)                  {
+        if (RTEST(val) && !RB_SYMBOL_P(val)) {
+            val = rb_check_string_type(val);
+            if (NIL_P(val)) {
+                rb_raise(rb_eTypeError, "create_id must be a String or Symbol");
+            }
+        }
+        parser_config_wb_write(self, &config->create_id, RTEST(val) ? val : Qfalse);
+    }
     else if (key == sym_decimal_class)              {
         if (RTEST(val)) {
             if (rb_respond_to(val, i_try_convert)) {
@@ -2205,6 +2293,7 @@ static void JSON_ParserConfig_mark(void *ptr)
     JSON_ParserConfig *config = ptr;
     rb_gc_mark_movable(config->on_load_proc);
     rb_gc_mark_movable(config->decimal_class);
+    rb_gc_mark_movable(config->create_id);
 }
 
 static size_t JSON_ParserConfig_memsize(const void *ptr)
@@ -2221,6 +2310,7 @@ static void JSON_ParserConfig_compact(void *ptr)
     JSON_ParserConfig *config = ptr;
     config->on_load_proc = rb_gc_location(config->on_load_proc);
     config->decimal_class = rb_gc_location(config->decimal_class);
+    config->create_id = rb_gc_location(config->create_id);
 }
 
 static const rb_data_type_t JSON_ParserConfig_type = {
@@ -2901,6 +2991,14 @@ void Init_parser(void)
     sym_on_load = ID2SYM(rb_intern("on_load"));
     sym_decimal_class = ID2SYM(rb_intern("decimal_class"));
     sym_allow_duplicate_key = ID2SYM(rb_intern("allow_duplicate_key"));
+    sym_on_duplicate_key = ID2SYM(rb_intern("on_duplicate_key"));
+    sym_create_additions = ID2SYM(rb_intern("create_additions"));
+    sym_create_id = ID2SYM(rb_intern("create_id"));
+    sym_reject = ID2SYM(rb_intern("reject"));
+    sym_use_last = ID2SYM(rb_intern("use_last"));
+
+    rb_global_variable(&JSON_default_create_id);
+    JSON_default_create_id = rb_obj_freeze(rb_utf8_str_new_cstr("json_class"));
 
     i_new = rb_intern("new");
     i_try_convert = rb_intern("try_convert");
@@ -2911,6 +3009,8 @@ void Init_parser(void)
     i_at_line = rb_intern("@line");
     i_at_column = rb_intern("@column");
     i_at_json_path = rb_intern("@json_path");
+    i_json_create = rb_intern("json_create");
+    i_json_path = rb_intern("json_path");
 
     binary_encindex = rb_ascii8bit_encindex();
     utf8_encindex = rb_utf8_encindex();
