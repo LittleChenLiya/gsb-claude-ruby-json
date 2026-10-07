@@ -50,6 +50,15 @@ struct generate_json_data;
 
 typedef void (*generator_func)(FBuffer *buffer, struct generate_json_data *data, VALUE obj);
 
+/* One level of the path to the value currently being generated.
+ * Frames live on the C stack and are linked from the innermost one,
+ * so the full path can be rendered when an error is raised.
+ * `key` is a String for object keys and a Fixnum for array indices. */
+struct generate_json_path_frame {
+    VALUE key;
+    struct generate_json_path_frame *parent;
+};
+
 struct generate_json_data {
     FBuffer *buffer;
     VALUE vstate;
@@ -57,6 +66,7 @@ struct generate_json_data {
     VALUE obj;
     generator_func func;
     long depth;
+    struct generate_json_path_frame *path;
 };
 
 static SIMD_Implementation simd_impl;
@@ -95,6 +105,32 @@ NORETURN(static void) raise_generator_error(VALUE invalid_object, const char *fm
     VALUE str = rb_vsprintf(fmt, args);
     va_end(args);
     raise_generator_error_str(invalid_object, str);
+}
+
+/* Renders the path of the value currently being generated, e.g. "$.items[1]".
+ * Only called on error paths, and doesn't invoke any user code so that no
+ * extra `to_json` calls happen before the error is raised. */
+static VALUE generator_error_path(struct generate_json_data *data)
+{
+    VALUE path = rb_utf8_str_new("$", 1);
+    if (data->path) {
+        /* Frames are linked from the innermost one, collect them to
+         * emit the path starting from the root. */
+        VALUE keys = rb_ary_new();
+        for (struct generate_json_path_frame *frame = data->path; frame; frame = frame->parent) {
+            rb_ary_push(keys, frame->key);
+        }
+        for (long i = RARRAY_LEN(keys) - 1; i >= 0; i--) {
+            VALUE key = RARRAY_AREF(keys, i);
+            if (RB_FIXNUM_P(key)) {
+                rb_str_catf(path, "[%ld]", FIX2LONG(key));
+            } else {
+                rb_str_cat(path, ".", 1);
+                rb_str_append(path, key);
+            }
+        }
+    }
+    return path;
 }
 
 // 0 - single byte char that don't need to be escaped.
@@ -1037,7 +1073,11 @@ json_object_i(VALUE key, VALUE val, VALUE _arg)
     if (RB_UNLIKELY(state->space_before)) fbuffer_append_str(buffer, data->state->space_before);
     fbuffer_append_char(buffer, ':');
     if (RB_UNLIKELY(state->space)) fbuffer_append_str(buffer, data->state->space);
+
+    struct generate_json_path_frame frame = { key_to_s, data->path };
+    data->path = &frame;
     generate_json(buffer, data, val);
+    data->path = frame.parent;
 
     return ST_CONTINUE;
 }
@@ -1109,7 +1149,10 @@ static void generate_json_array(FBuffer *buffer, struct generate_json_data *data
         if (RB_UNLIKELY(data->state->indent)) {
             fbuffer_append_str_repeat(buffer, data->state->indent, depth);
         }
+        struct generate_json_path_frame frame = { LONG2FIX(i), data->path };
+        data->path = &frame;
         generate_json(buffer, data, RARRAY_AREF(obj, i));
+        data->path = frame.parent;
     }
     data->depth = --depth;
     if (RB_UNLIKELY(data->state->array_nl)) {
@@ -1177,7 +1220,8 @@ static void generate_json_float(FBuffer *buffer, struct generate_json_data *data
                     return;
                 }
             }
-            raise_generator_error(obj, "%"PRIsVALUE" not allowed in JSON", rb_funcall(obj, i_to_s, 0));
+            raise_generator_error(obj, "%"PRIsVALUE" not allowed in JSON at %"PRIsVALUE,
+                    rb_funcall(obj, i_to_s, 0), generator_error_path(data));
         }
 
         VALUE tmp = rb_funcall(obj, i_to_s, 0);
@@ -1340,7 +1384,8 @@ static inline VALUE cState_partial_generate(VALUE self, VALUE obj, generator_fun
         .state = state,
         .depth = state->depth,
         .obj = obj,
-        .func = func
+        .func = func,
+        .path = NULL
     };
     return rb_ensure(generate_json_try, (VALUE)&data, generate_json_ensure, (VALUE)&data);
 }

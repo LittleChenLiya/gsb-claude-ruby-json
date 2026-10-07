@@ -411,6 +411,48 @@ class JSONGeneratorTest < Test::Unit::TestCase
     assert_equal "[\n  -Infinity\n]", pretty_generate([JSON::MinusInfinity], allow_nan: true)
   end
 
+  # Regression: NaN/Infinity generator errors carry the path of the offending
+  # value (array index or object key), siblings placed after it never receive
+  # `to_json`, and `allow_nan: true` keeps the historical output.
+  def test_allow_nan_error_path
+    counting_class = Class.new do
+      def initialize(name, log)
+        @name = name
+        @log = log
+      end
+
+      def to_json(*)
+        @log << @name
+        'null'
+      end
+    end
+
+    {
+      JSON::NaN => 'NaN',
+      JSON::Infinity => 'Infinity',
+      JSON::MinusInfinity => '-Infinity',
+    }.each do |float, name|
+      log = []
+      payload = { 'items' => [counting_class.new(:before, log), float, counting_class.new(:after, log)] }
+
+      error = assert_raise(GeneratorError) { generate(payload) }
+      assert_same float, error.invalid_object
+      assert_equal "#{name} not allowed in JSON at $.items[1]", error.message
+      assert_equal [:before], log
+
+      log = []
+      payload = { 'items' => [counting_class.new(:before, log), float, counting_class.new(:after, log)] }
+      assert_equal "{\"items\":[null,#{name},null]}", generate(payload, allow_nan: true)
+      assert_equal [:before, :after], log
+    end
+
+    error = assert_raise(GeneratorError) { generate({ 'a' => { 'b' => [JSON::NaN] } }) }
+    assert_equal 'NaN not allowed in JSON at $.a.b[0]', error.message
+
+    error = assert_raise(GeneratorError) { generate(JSON::Infinity) }
+    assert_equal 'Infinity not allowed in JSON at $', error.message
+  end
+
   # An object that changes state.depth when it receives to_json(state)
   def bad_to_json
     obj = Object.new
